@@ -1,15 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
-	"os/signal"
-	"strings"
-	"syscall"
 
 	"github.com/spf13/viper"
 	"gopkg.in/telebot.v3"
@@ -33,6 +29,7 @@ type Config struct {
 type UserState struct {
 	Model        string
 	SystemPrompt string
+	History      []ChatMessage // Conversation history
 }
 
 var userStates = make(map[int64]*UserState)
@@ -140,7 +137,7 @@ func fetchModels() ([]string, error) {
 	return nil, nil
 }
 
-// Send chat request with streaming
+// Send chat request
 func sendChat(chatID int64, message string) (string, error) {
 	state := userStates[chatID]
 	if state == nil {
@@ -148,10 +145,19 @@ func sendChat(chatID int64, message string) (string, error) {
 		userStates[chatID] = state
 	}
 
-	messages := []ChatMessage{
-		{Role: "system", Content: state.SystemPrompt},
-		{Role: "user", Content: message},
+	// Build messages: system + history + new message
+	messages := []ChatMessage{}
+	
+	// Add system prompt
+	if state.SystemPrompt != "" {
+		messages = append(messages, ChatMessage{Role: "system", Content: state.SystemPrompt})
 	}
+	
+	// Add conversation history
+	messages = append(messages, state.History...)
+	
+	// Add new user message
+	messages = append(messages, ChatMessage{Role: "user", Content: message})
 
 	reqBody := ChatRequest{
 		Model:    state.Model,
@@ -174,45 +180,32 @@ func sendChat(chatID int64, message string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	// Try to parse as non-streaming first
+	// Parse response
 	var response ChatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&response); err == nil {
-		if len(response.Choices) > 0 {
-			return response.Choices[0].Message.Content, nil
-		}
-	} else {
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		logger.Error("failed to parse response", slog.Any("error", err))
+		return "", err
 	}
 
-	// If that didn't work, try streaming
-	// (this is a fallback, re-do the request as streaming)
-
-	var fullContent string
-	var debugResp string
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		debugResp += line + "\n"
-		if strings.HasPrefix(line, "data: ") {
-			data := strings.TrimPrefix(line, "data: ")
-			if data == "[DONE]" {
-				break
-			}
-			var response ChatResponse
-			if err := json.Unmarshal([]byte(data), &response); err == nil {
-				if len(response.Choices) > 0 {
-					fullContent += response.Choices[0].Message.Content
-				}
-			}
-		}
+	if len(response.Choices) == 0 {
+		return "", nil
 	}
 
-	// Debug: log if no content found
-	if fullContent == "" {
-		logger.Error("no content parsed", slog.String("debug", debugResp))
+	assistantReply := response.Choices[0].Message.Content
+
+	// Add to conversation history
+	state.History = append(state.History, ChatMessage{Role: "user", Content: message})
+	state.History = append(state.History, ChatMessage{Role: "assistant", Content: assistantReply})
+	
+	// Keep history manageable (last 20 messages = 10 exchanges)
+	if len(state.History) > 40 {
+		state.History = state.History[len(state.History)-40:]
 	}
 
-	return fullContent, nil
+	// Save state
+	saveUserState(chatID, state)
+
+	return assistantReply, nil
 }
 
 func main() {
@@ -248,7 +241,7 @@ func main() {
 	b.Handle("/start", func(c telebot.Context) error {
 		state := loadUserState(c.Chat().ID)
 		userStates[c.Chat().ID] = state
-		return c.Send("Welcome! I'm your AI assistant.\n\nCurrent model: "+state.Model+"\n\nCommands:\n/model - Switch model\n/models - List available models\n/system - Set system prompt\n/reset - Clear conversation")
+		return c.Send("Welcome! I'm your AI assistant.\n\nCurrent model: "+state.Model+"\n\nCommands:\n/model - Switch model\n/models - List available models\n/system - Set system prompt\n/clear - Clear conversation history\n/reset - Reset to default")
 	})
 
 	b.Handle("/model", func(c telebot.Context) error {
@@ -289,6 +282,14 @@ func main() {
 		return c.Send("System prompt reset to default.")
 	})
 
+	b.Handle("/clear", func(c telebot.Context) error {
+		state := loadUserState(c.Chat().ID)
+		state.History = nil
+		saveUserState(c.Chat().ID, state)
+		userStates[c.Chat().ID] = state
+		return c.Send("Conversation cleared. Starting fresh!")
+	})
+
 	// Handle text messages (not commands)
 	b.Handle(telebot.OnText, func(c telebot.Context) error {
 		msg := c.Message().Text
@@ -326,12 +327,5 @@ func main() {
 
 	// Start
 	logger.Info("Starting bot")
-	go bot.Start()
-
-	// Wait for shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
-
-	logger.Info("Shutting down bot")
+	bot.Start()
 }
