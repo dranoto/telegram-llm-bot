@@ -1,0 +1,14 @@
+# Binaries
+telegram-llm-bot
+bin/
+
+# Data
+data/store/
+*.log
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
