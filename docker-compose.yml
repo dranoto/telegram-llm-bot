@@ -1,0 +1,8 @@
+services:
+  telegram-llm-bot:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
