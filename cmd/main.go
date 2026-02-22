@@ -451,15 +451,17 @@ func main() {
 			return c.Send("No response received.")
 		}
 		
-		// Try HTML mode first (more forgiving than Markdown), fall back to plain text
-		htmlResponse := convertMarkdownToHTML(response)
-		err = c.Send(htmlResponse, telebot.ModeHTML)
+		logger.Info("response received", slog.Int("length", len(response)), slog.Int("tokens_approx", len(response)/4))
+		
+		// Try plain text first (skip HTML conversion which might cause issues)
+		err = c.Send(response)
 		if err != nil {
-			// If still fails, split into chunks
-			logger.Warn("html send failed, trying plain", slog.Any("error", err))
-			err = c.Send(response)
+			logger.Warn("plain send failed, trying HTML", slog.Any("error", err))
+			// Try HTML mode
+			htmlResponse := convertMarkdownToHTML(response)
+			err = c.Send(htmlResponse, telebot.ModeHTML)
 			if err != nil {
-				logger.Error("plain send failed, splitting", slog.Any("error", err))
+				logger.Error("HTML send failed, splitting", slog.Any("error", err))
 				return splitAndSend(c, response)
 			}
 		}
