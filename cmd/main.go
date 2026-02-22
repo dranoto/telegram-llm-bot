@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/spf13/viper"
 	"gopkg.in/telebot.v3"
@@ -16,6 +19,7 @@ var (
 	logger      = slog.Default().With(slog.String("package", "main"))
 	httpClient = &http.Client{}
 	bot        *telebot.Bot
+	mu         sync.Mutex
 )
 
 // Config
@@ -32,6 +36,7 @@ type UserState struct {
 	SystemPrompt string                   `json:"system_prompt"`
 	History      []ChatMessage            `json:"history"`
 	Presets      map[string]Preset       `json:"presets"`
+	PendingInput string                   `json:"pending_input"` // "model" or "system" if waiting for input
 }
 
 type Preset struct {
@@ -253,6 +258,22 @@ func main() {
 	bot = b
 	logger.Info("bot created successfully", slog.String("bot_name", b.Me.Username))
 
+	// Start periodic cleanup of in-memory states (every 10 minutes)
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			mu.Lock()
+			for chatID := range userStates {
+				// Keep only current user in memory, reload others from disk on next use
+				if chatID != b.Me.ID {
+					delete(userStates, chatID)
+				}
+			}
+			mu.Unlock()
+		}
+	}()
+
 	// Commands
 	b.Handle("/start", func(c telebot.Context) error {
 		state := loadUserState(c.Chat().ID)
@@ -260,7 +281,21 @@ func main() {
 		return c.Send("Welcome! I'm your AI assistant.\n\nCurrent model: "+state.Model+"\n\nCommands:\n/model - Switch model\n/models - List models\n/set <n> <model> <prompt> - Save preset\n/preset - List presets\n/preset <n> - Load preset\n/new - New conversation\n/reset - Reset system prompt")
 	})
 
+	b.Handle("/status", func(c telebot.Context) error {
+		state := loadUserState(c.Chat().ID)
+		userStates[c.Chat().ID] = state
+		msg := "*Current Status*\n\n"
+		msg += "Model: "+state.Model+"\n"
+		msg += "System: "+state.SystemPrompt+"\n"
+		msg += "History: " + fmt.Sprintf("%d", len(state.History)) + " messages"
+		return c.Send(msg, telebot.ModeMarkdown)
+	})
+
 	b.Handle("/model", func(c telebot.Context) error {
+		state := loadUserState(c.Chat().ID)
+		userStates[c.Chat().ID] = state
+		state.PendingInput = "model"
+		saveUserState(c.Chat().ID, state)
 		return c.Send("Send me the model name you want to use. Use /models to see available options.")
 	})
 
@@ -278,7 +313,7 @@ func main() {
 		display := "Available models:\n\n"
 		for i, m := range models {
 			if i >= 20 {
-				display += "\n...and " + string(rune(len(models)-20)+'0') + " more"
+				display += "\n...and " + fmt.Sprintf("%d", len(models)-20) + " more"
 				break
 			}
 			display += "- " + m + "\n"
@@ -287,6 +322,10 @@ func main() {
 	})
 
 	b.Handle("/system", func(c telebot.Context) error {
+		state := loadUserState(c.Chat().ID)
+		userStates[c.Chat().ID] = state
+		state.PendingInput = "system"
+		saveUserState(c.Chat().ID, state)
 		return c.Send("Send me the system prompt you want to use.")
 	})
 
@@ -316,13 +355,19 @@ func main() {
 
 	// /set 1 model_name system_prompt - save a preset
 	b.Handle("/set", func(c telebot.Context) error {
-		args := c.Args()
-		if len(args) < 3 {
-			return c.Send("Usage: /set <slot> <model> <system prompt>\nExample: /set 1 llama3 You are a helpful assistant.")
+		// Parse manually from raw text since Args() may not work as expected
+		msg := c.Message().Text
+		parts := strings.Fields(strings.TrimPrefix(msg, "/set"))
+		
+		if len(parts) < 2 {
+			return c.Send("Usage: /set <slot> <model> [system prompt]\nExample: /set 1 llama3\nExample: /set 2 glm-5 You are a coder.")
 		}
-		slot := args[0]
-		model := args[1]
-		systemPrompt := args[2]
+		slot := parts[0]
+		model := parts[1]
+		systemPrompt := "You are a helpful assistant."
+		if len(parts) >= 3 {
+			systemPrompt = strings.Join(parts[2:], " ")
+		}
 		
 		state := loadUserState(c.Chat().ID)
 		state.Presets[slot] = Preset{Model: model, SystemPrompt: systemPrompt}
@@ -354,7 +399,6 @@ func main() {
 		}
 		state.Model = preset.Model
 		state.SystemPrompt = preset.SystemPrompt
-		state.History = nil // Clear history when switching
 		saveUserState(c.Chat().ID, state)
 		userStates[c.Chat().ID] = state
 		return c.Send("Switched to preset "+slot+":\nModel: "+preset.Model+"\nSystem: "+preset.SystemPrompt)
@@ -369,18 +413,20 @@ func main() {
 			return nil
 		}
 		
-		// Check if waiting for model
-		if userStates[c.Chat().ID] != nil && userStates[c.Chat().ID].Model == "" {
+		// Check if waiting for model input
+		if userStates[c.Chat().ID] != nil && userStates[c.Chat().ID].PendingInput == "model" {
 			state := userStates[c.Chat().ID]
 			state.Model = msg
+			state.PendingInput = ""
 			saveUserState(c.Chat().ID, state)
 			return c.Send("Model set to: " + msg)
 		}
 
-		// Check if waiting for system prompt
-		if userStates[c.Chat().ID] != nil && userStates[c.Chat().ID].SystemPrompt == "" {
+		// Check if waiting for system prompt input
+		if userStates[c.Chat().ID] != nil && userStates[c.Chat().ID].PendingInput == "system" {
 			state := userStates[c.Chat().ID]
 			state.SystemPrompt = msg
+			state.PendingInput = ""
 			saveUserState(c.Chat().ID, state)
 			return c.Send("System prompt updated.")
 		}
@@ -400,4 +446,6 @@ func main() {
 		// Send with markdown mode
 		return c.Send(response, telebot.ModeMarkdown)
 	})
+
+	bot.Start()
 }
