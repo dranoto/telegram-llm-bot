@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/spf13/viper"
 	"gopkg.in/telebot.v3"
@@ -27,9 +28,15 @@ type Config struct {
 
 // User state
 type UserState struct {
-	Model        string
-	SystemPrompt string
-	History      []ChatMessage // Conversation history
+	Model        string                   `json:"model"`
+	SystemPrompt string                   `json:"system_prompt"`
+	History      []ChatMessage            `json:"history"`
+	Presets      map[string]Preset       `json:"presets"`
+}
+
+type Preset struct {
+	Model        string `json:"model"`
+	SystemPrompt string `json:"system_prompt"`
 }
 
 var userStates = make(map[int64]*UserState)
@@ -39,15 +46,24 @@ func loadUserState(chatID int64) *UserState {
 	state := &UserState{
 		Model:        viper.GetString("default_model"),
 		SystemPrompt: "You are a helpful assistant.",
+		Presets:      make(map[string]Preset),
 	}
 
 	filePath := getStateFilePath(chatID)
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		return state // Return default
+		// Try to load preset 1 by default
+		state.Presets["1"] = Preset{Model: state.Model, SystemPrompt: state.SystemPrompt}
+		return state
 	}
 
 	json.Unmarshal(data, state)
+	
+	// If no presets, set current as preset 1
+	if len(state.Presets) == 0 {
+		state.Presets["1"] = Preset{Model: state.Model, SystemPrompt: state.SystemPrompt}
+	}
+	
 	return state
 }
 
@@ -241,7 +257,7 @@ func main() {
 	b.Handle("/start", func(c telebot.Context) error {
 		state := loadUserState(c.Chat().ID)
 		userStates[c.Chat().ID] = state
-		return c.Send("Welcome! I'm your AI assistant.\n\nCurrent model: "+state.Model+"\n\nCommands:\n/model - Switch model\n/models - List available models\n/system - Set system prompt\n/clear - Clear conversation history\n/reset - Reset to default")
+		return c.Send("Welcome! I'm your AI assistant.\n\nCurrent model: "+state.Model+"\n\nCommands:\n/model - Switch model\n/models - List models\n/set <n> <model> <prompt> - Save preset\n/preset - List presets\n/preset <n> - Load preset\n/new - New conversation\n/reset - Reset system prompt")
 	})
 
 	b.Handle("/model", func(c telebot.Context) error {
@@ -290,9 +306,68 @@ func main() {
 		return c.Send("Conversation cleared. Starting fresh!")
 	})
 
+	b.Handle("/new", func(c telebot.Context) error {
+		state := loadUserState(c.Chat().ID)
+		state.History = nil
+		saveUserState(c.Chat().ID, state)
+		userStates[c.Chat().ID] = state
+		return c.Send("New conversation started!")
+	})
+
+	// /set 1 model_name system_prompt - save a preset
+	b.Handle("/set", func(c telebot.Context) error {
+		args := c.Args()
+		if len(args) < 3 {
+			return c.Send("Usage: /set <slot> <model> <system prompt>\nExample: /set 1 llama3 You are a helpful assistant.")
+		}
+		slot := args[0]
+		model := args[1]
+		systemPrompt := args[2]
+		
+		state := loadUserState(c.Chat().ID)
+		state.Presets[slot] = Preset{Model: model, SystemPrompt: systemPrompt}
+		saveUserState(c.Chat().ID, state)
+		userStates[c.Chat().ID] = state
+		return c.Send("Saved preset "+slot+": "+model+"\n"+systemPrompt)
+	})
+
+	// /preset - list presets, /preset <n> - load preset
+	b.Handle("/preset", func(c telebot.Context) error {
+		args := c.Args()
+		// Handle /preset, /preset list
+		if len(args) < 1 || (len(args) >= 1 && (args[0] == "list" || args[0] == "help")) {
+			state := loadUserState(c.Chat().ID)
+			if len(state.Presets) == 0 {
+				return c.Send("No presets saved. Use /set <slot> <model> <prompt>")
+			}
+			msg := "Saved presets:\n"
+			for k, v := range state.Presets {
+				msg += "/" + k + ": " + v.Model + "\n"
+			}
+			return c.Send(msg)
+		}
+		slot := args[0]
+		state := loadUserState(c.Chat().ID)
+		preset, ok := state.Presets[slot]
+		if !ok {
+			return c.Send("Preset "+slot+" not found. Use /set to create one.")
+		}
+		state.Model = preset.Model
+		state.SystemPrompt = preset.SystemPrompt
+		state.History = nil // Clear history when switching
+		saveUserState(c.Chat().ID, state)
+		userStates[c.Chat().ID] = state
+		return c.Send("Switched to preset "+slot+":\nModel: "+preset.Model+"\nSystem: "+preset.SystemPrompt)
+	})
+
 	// Handle text messages (not commands)
 	b.Handle(telebot.OnText, func(c telebot.Context) error {
 		msg := c.Message().Text
+		
+		// Skip commands - let command handlers deal with them
+		if strings.HasPrefix(msg, "/") {
+			return nil
+		}
 		
 		// Check if waiting for model
 		if userStates[c.Chat().ID] != nil && userStates[c.Chat().ID].Model == "" {
@@ -310,8 +385,8 @@ func main() {
 			return c.Send("System prompt updated.")
 		}
 
-		// Regular chat
-		c.Send("Thinking...", telebot.NoPreview)
+		// Regular chat - show typing indicator
+		c.Send(telebot.Typing)
 		
 		response, err := sendChat(c.Chat().ID, msg)
 		if err != nil {
@@ -322,10 +397,7 @@ func main() {
 			return c.Send("No response received.")
 		}
 		
-		return c.Send(response, telebot.NoPreview)
+		// Send with markdown mode
+		return c.Send(response, telebot.ModeMarkdown)
 	})
-
-	// Start
-	logger.Info("Starting bot")
-	bot.Start()
 }
