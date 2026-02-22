@@ -118,7 +118,7 @@ func getStateFilePath(chatID int64) string {
 }
 
 func int64ToString(i int64) string {
-	return string(rune(i))
+	return fmt.Sprintf("%d", i)
 }
 
 // API types
