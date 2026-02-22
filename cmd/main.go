@@ -347,11 +347,18 @@ func main() {
 	})
 
 	b.Handle("/new", func(c telebot.Context) error {
-		state := loadUserState(c.Chat().ID)
-		state.History = nil
-		saveUserState(c.Chat().ID, state)
-		userStates[c.Chat().ID] = state
-		return c.Send("New conversation started!")
+		chatID := c.Chat().ID
+		
+		// Delete state file entirely for a fresh start
+		statePath := getStateFilePath(chatID)
+		os.Remove(statePath)
+		
+		// Clear in-memory state
+		mu.Lock()
+		delete(userStates, chatID)
+		mu.Unlock()
+		
+		return c.Send("New conversation started! All context cleared.")
 	})
 
 	// /set 1 model_name system_prompt - save a preset
@@ -432,8 +439,8 @@ func main() {
 			return c.Send("System prompt updated.")
 		}
 
-		// Show typing indicator
-		c.Notify(telebot.Typing)
+		// Show typing indicator using bot directly
+		bot.Notify(c.Chat(), telebot.Typing)
 		
 		response, err := sendChat(c.Chat().ID, msg)
 		if err != nil {
@@ -449,8 +456,12 @@ func main() {
 		err = c.Send(htmlResponse, telebot.ModeHTML)
 		if err != nil {
 			// If still fails, split into chunks
-			logger.Error("failed to send response", slog.Any("error", err))
-			return splitAndSend(c, response)
+			logger.Warn("html send failed, trying plain", slog.Any("error", err))
+			err = c.Send(response)
+			if err != nil {
+				logger.Error("plain send failed, splitting", slog.Any("error", err))
+				return splitAndSend(c, response)
+			}
 		}
 		return nil
 	})
@@ -515,28 +526,39 @@ func splitAndSend(c telebot.Context, text string) error {
 	var chunk string
 	
 	for _, line := range lines {
-		if len(chunk)+len(line)+1 > maxLen {
+		// Handle empty lines
+		if line == "" {
+			chunk += "\n"
+			continue
+		}
+		
+		// If single line is too long, split by words
+		if len(line) > maxLen {
 			if chunk != "" {
 				if err := c.Send(chunk); err != nil {
 					return err
 				}
 				chunk = ""
 			}
-			// If single line is too long, split by words
-			if len(line) > maxLen {
-				words := strings.Split(line, " ")
-				for _, word := range words {
-					if len(chunk)+len(word)+1 > maxLen {
-						if err := c.Send(chunk); err != nil {
-							return err
-						}
-						chunk = ""
+			words := strings.Split(line, " ")
+			for _, word := range words {
+				if len(chunk)+len(word)+1 > maxLen {
+					if err := c.Send(chunk); err != nil {
+						return err
 					}
-					chunk += word + " "
+					chunk = ""
 				}
-			} else {
-				chunk = line
+				chunk += word + " "
 			}
+			continue
+		}
+		
+		// Normal line
+		if len(chunk)+len(line)+1 > maxLen {
+			if err := c.Send(chunk); err != nil {
+				return err
+			}
+			chunk = line
 		} else {
 			chunk += line + "\n"
 		}
