@@ -527,7 +527,12 @@ func main() {
 		
 		response, err := sendChat(c.Chat().ID, msg)
 		if err != nil {
-			return c.Send("Error: " + err.Error())
+			errMsg := err.Error()
+			// Check for timeout errors
+			if strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "deadline") {
+				return c.Send("Request timed out. Try a shorter prompt or increase timeout_secs in config.")
+			}
+			return c.Send("Error: " + errMsg)
 		}
 		
 		if response == "" {
