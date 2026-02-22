@@ -23,12 +23,43 @@ var (
 	mu         sync.Mutex
 )
 
+// isAllowed checks if the user is in the allowed list
+func isAllowed(userID int64) bool {
+	allowedIface := viper.Get("allowed_users")
+	if allowedIface == nil {
+		return true // Allow all if no list configured
+	}
+	allowed, ok := allowedIface.([]interface{})
+	if !ok || len(allowed) == 0 {
+		return true // Allow all if no list configured
+	}
+	for _, item := range allowed {
+		// Handle both int and float (JSON numbers)
+		switch v := item.(type) {
+		case int64:
+			if v == userID {
+				return true
+			}
+		case int:
+			if int64(v) == userID {
+				return true
+			}
+		case float64:
+			if int64(v) == userID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Config
 type Config struct {
-	APIToken     string `mapstructure:"api_token"`     // Telegram bot token
-	APIEndpoint  string `mapstructure:"api_endpoint"`  // OpenAI-compatible endpoint
-	APIKey       string `mapstructure:"api_key"`      // API key for the LLM
-	DefaultModel string `mapstructure:"default_model"` // Default model
+	APIToken     string   `mapstructure:"api_token"`     // Telegram bot token
+	APIEndpoint  string   `mapstructure:"api_endpoint"`   // OpenAI-compatible endpoint
+	APIKey       string   `mapstructure:"api_key"`       // API key for the LLM
+	DefaultModel string   `mapstructure:"default_model"` // Default model
+	AllowedUsers []int64  `mapstructure:"allowed_users"` // Allowed Telegram user IDs
 }
 
 // User state
@@ -274,6 +305,17 @@ func main() {
 			mu.Unlock()
 		}
 	}()
+
+	// Middleware to check allowed users
+	b.Use(func(next telebot.HandlerFunc) telebot.HandlerFunc {
+		return func(c telebot.Context) error {
+			if !isAllowed(c.Sender().ID) {
+				logger.Warn("unauthorized user tried to access bot", slog.Int64("user_id", c.Sender().ID))
+				return c.Send("Sorry, this bot is not available to you.")
+			}
+			return next(c)
+		}
+	})
 
 	// Commands
 	b.Handle("/start", func(c telebot.Context) error {

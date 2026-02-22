@@ -2,3 +2,5 @@ api_token: "8119779793:AAH1ldp4KMhLJFgbEN84h1E2bFW-8gTSgn8"
 api_endpoint: "https://nano-gpt.com/api/v1"
 api_key: "sk-nano-dcb444a0-740f-4bac-a53d-09ca2e9ca93a"
 default_model: "qwen/qwen3.5-397b-a17b-thinking"
+allowed_users:
+  - 8059849406
