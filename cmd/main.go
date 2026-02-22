@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -431,8 +432,8 @@ func main() {
 			return c.Send("System prompt updated.")
 		}
 
-		// Regular chat - show typing indicator
-		c.Send(telebot.Typing)
+		// Show typing indicator
+		c.Notify(telebot.Typing)
 		
 		response, err := sendChat(c.Chat().ID, msg)
 		if err != nil {
@@ -443,9 +444,106 @@ func main() {
 			return c.Send("No response received.")
 		}
 		
-		// Send with markdown mode
-		return c.Send(response, telebot.ModeMarkdown)
+		// Try HTML mode first (more forgiving than Markdown), fall back to plain text
+		htmlResponse := convertMarkdownToHTML(response)
+		err = c.Send(htmlResponse, telebot.ModeHTML)
+		if err != nil {
+			// If still fails, split into chunks
+			logger.Error("failed to send response", slog.Any("error", err))
+			return splitAndSend(c, response)
+		}
+		return nil
 	})
 
 	bot.Start()
+}
+
+// convertMarkdownToHTML converts basic markdown to HTML for Telegram
+func convertMarkdownToHTML(text string) string {
+	// Escape HTML characters first
+	text = strings.ReplaceAll(text, "&", "&amp;")
+	text = strings.ReplaceAll(text, "<", "&lt;")
+	text = strings.ReplaceAll(text, ">", "&gt;")
+
+	// Headers
+	text = regexp.MustCompile(`(?m)^###### (.+)$`).ReplaceAllString(text, "<h6>$1</h6>")
+	text = regexp.MustCompile(`(?m)^##### (.+)$`).ReplaceAllString(text, "<h5>$1</h5>")
+	text = regexp.MustCompile(`(?m)^#### (.+)$`).ReplaceAllString(text, "<h4>$1</h4>")
+	text = regexp.MustCompile(`(?m)^### (.+)$`).ReplaceAllString(text, "<h3>$1</h3>")
+	text = regexp.MustCompile(`(?m)^## (.+)$`).ReplaceAllString(text, "<h2>$1</h2>")
+	text = regexp.MustCompile(`(?m)^# (.+)$`).ReplaceAllString(text, "<h1>$1</h1>")
+
+	// Bold
+	text = regexp.MustCompile(`\*\*(.+?)\*\*`).ReplaceAllString(text, "<b>$1</b>")
+	text = regexp.MustCompile(`__(.+?)__`).ReplaceAllString(text, "<b>$1</b>")
+
+	// Italic
+	text = regexp.MustCompile(`\*(.+?)\*`).ReplaceAllString(text, "<i>$1</i>")
+	text = regexp.MustCompile(`_(.+?)_`).ReplaceAllString(text, "<i>$1</i>")
+
+	// Strikethrough
+	text = regexp.MustCompile(`~~(.+?)~~`).ReplaceAllString(text, "<s>$1</s>")
+
+	// Code blocks
+	text = regexp.MustCompile("```(\\w+)?\\n([\\s\\S]*?)```").ReplaceAllString(text, "<code>$2</code>")
+	text = regexp.MustCompile("`(.+?)`").ReplaceAllString(text, "<code>$1</code>")
+
+	// Links
+	text = regexp.MustCompile(`\[(.+?)\]\((.+?)\)`).ReplaceAllString(text, "<a href=\"$2\">$1</a>")
+
+	// Unordered lists
+	text = regexp.MustCompile(`(?m)^[\-\*] (.+)$`).ReplaceAllString(text, "• $1")
+
+	// Ordered lists
+	text = regexp.MustCompile(`(?m)^(\d+)\. (.+)$`).ReplaceAllString(text, "$1. $2")
+
+	// Blockquotes
+	text = regexp.MustCompile(`(?m)^> (.+)$`).ReplaceAllString(text, ">$1")
+
+	return text
+}
+
+// splitAndSend splits long messages into chunks under Telegram's 4096 limit
+func splitAndSend(c telebot.Context, text string) error {
+	const maxLen = 4000 // Leave room for safety
+	if len(text) <= maxLen {
+		return c.Send(text)
+	}
+	
+	// Split by paragraphs first, then by words if needed
+	lines := strings.Split(text, "\n")
+	var chunk string
+	
+	for _, line := range lines {
+		if len(chunk)+len(line)+1 > maxLen {
+			if chunk != "" {
+				if err := c.Send(chunk); err != nil {
+					return err
+				}
+				chunk = ""
+			}
+			// If single line is too long, split by words
+			if len(line) > maxLen {
+				words := strings.Split(line, " ")
+				for _, word := range words {
+					if len(chunk)+len(word)+1 > maxLen {
+						if err := c.Send(chunk); err != nil {
+							return err
+						}
+						chunk = ""
+					}
+					chunk += word + " "
+				}
+			} else {
+				chunk = line
+			}
+		} else {
+			chunk += line + "\n"
+		}
+	}
+	
+	if chunk != "" {
+		return c.Send(chunk)
+	}
+	return nil
 }
