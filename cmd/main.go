@@ -21,6 +21,7 @@ var (
 	httpClient = &http.Client{}
 	bot        *telebot.Bot
 	mu         sync.Mutex
+	userQueues = make(map[int64]chan string) // Message queue per user
 )
 
 // isAllowed checks if the user is in the allowed list
@@ -241,6 +242,12 @@ func sendChat(chatID int64, message string) (string, error) {
 	}
 	defer resp.Body.Close()
 
+	// Check HTTP status
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		logger.Error("API request failed", slog.Int("status", resp.StatusCode))
+		return "", fmt.Errorf("API request failed with status %d", resp.StatusCode)
+	}
+
 	// Parse response
 	var response ChatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
@@ -269,8 +276,52 @@ func sendChat(chatID int64, message string) (string, error) {
 	return assistantReply, nil
 }
 
+// processMessageQueue handles queued messages for a user one at a time
+func processMessageQueue(chatID int64, c telebot.Context) {
+	queue := userQueues[chatID]
+	
+	for msg := range queue {
+		// Show typing indicator
+		bot.Notify(c.Chat(), telebot.Typing)
+		
+		response, err := sendChat(chatID, msg)
+		if err != nil {
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "deadline") {
+				c.Send("Request timed out. Try a shorter prompt or increase timeout_secs in config.")
+			} else {
+				c.Send("Error: " + errMsg)
+			}
+			continue
+		}
+		
+		if response == "" {
+			c.Send("No response received.")
+			continue
+		}
+		
+		logger.Info("response received", slog.Int("length", len(response)), slog.Int("tokens_approx", len(response)/4))
+		
+		// Try plain text first
+		err = c.Send(response)
+		if err != nil {
+			logger.Warn("plain send failed, trying HTML", slog.Any("error", err))
+			htmlResponse := convertMarkdownToHTML(response)
+			err = c.Send(htmlResponse, telebot.ModeHTML)
+			if err != nil {
+				logger.Error("HTML send failed, splitting", slog.Any("error", err))
+				splitAndSend(c, response)
+			}
+		}
+	}
+	
+	// Clean up when queue is closed
+	mu.Lock()
+	delete(userQueues, chatID)
+	mu.Unlock()
+}
+
 func main() {
-	// Setup logging
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	logger = slog.Default().With(slog.String("package", "main"))
 
@@ -522,38 +573,23 @@ func main() {
 			return c.Send("System prompt updated.")
 		}
 
-		// Show typing indicator using bot directly
-		bot.Notify(c.Chat(), telebot.Typing)
-		
-		response, err := sendChat(c.Chat().ID, msg)
-		if err != nil {
-			errMsg := err.Error()
-			// Check for timeout errors
-			if strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "deadline") {
-				return c.Send("Request timed out. Try a shorter prompt or increase timeout_secs in config.")
-			}
-			return c.Send("Error: " + errMsg)
+		// Get or create queue for this user
+		mu.Lock()
+		if userQueues[c.Chat().ID] == nil {
+			userQueues[c.Chat().ID] = make(chan string, 10)
+			// Start worker for this user
+			go processMessageQueue(c.Chat().ID, c)
 		}
+		queue := userQueues[c.Chat().ID]
+		mu.Unlock()
 		
-		if response == "" {
-			return c.Send("No response received.")
+		// Queue the message (non-blocking)
+		select {
+		case queue <- msg:
+			return nil
+		default:
+			return c.Send("Please wait, your previous request is still processing.")
 		}
-		
-		logger.Info("response received", slog.Int("length", len(response)), slog.Int("tokens_approx", len(response)/4))
-		
-		// Try plain text first (skip HTML conversion which might cause issues)
-		err = c.Send(response)
-		if err != nil {
-			logger.Warn("plain send failed, trying HTML", slog.Any("error", err))
-			// Try HTML mode
-			htmlResponse := convertMarkdownToHTML(response)
-			err = c.Send(htmlResponse, telebot.ModeHTML)
-			if err != nil {
-				logger.Error("HTML send failed, splitting", slog.Any("error", err))
-				return splitAndSend(c, response)
-			}
-		}
-		return nil
 	})
 
 	bot.Start()
