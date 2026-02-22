@@ -56,10 +56,12 @@ func isAllowed(userID int64) bool {
 // Config
 type Config struct {
 	APIToken     string   `mapstructure:"api_token"`     // Telegram bot token
-	APIEndpoint  string   `mapstructure:"api_endpoint"`   // OpenAI-compatible endpoint
-	APIKey       string   `mapstructure:"api_key"`       // API key for the LLM
+	APIEndpoint  string   `mapstructure:"api_endpoint"`  // OpenAI-compatible endpoint
+	APIKey       string   `mapstructure:"api_key"`      // API key for the LLM
 	DefaultModel string   `mapstructure:"default_model"` // Default model
 	AllowedUsers []int64  `mapstructure:"allowed_users"` // Allowed Telegram user IDs
+	MaxTokens    int      `mapstructure:"max_tokens"`    // Max tokens for LLM response (default 16000)
+	TimeoutSecs  int      `mapstructure:"timeout_secs"`  // API timeout in seconds (default 300)
 }
 
 // User state
@@ -212,10 +214,16 @@ func sendChat(chatID int64, message string) (string, error) {
 	// Add new user message
 	messages = append(messages, ChatMessage{Role: "user", Content: message})
 
+	maxTokens := viper.GetInt("max_tokens")
+	if maxTokens <= 0 {
+		maxTokens = 16000
+	}
+
 	reqBody := ChatRequest{
 		Model:    state.Model,
 		Messages: messages,
 		Stream:   false,
+		MaxTokens: maxTokens,
 	}
 
 	body, _ := json.Marshal(reqBody)
@@ -273,6 +281,39 @@ func main() {
 	viper.AddConfigPath("config")
 	viper.AddConfigPath("data/config")
 	viper.ReadInConfig()
+
+	// Validate required config
+	if viper.GetString("api_token") == "" {
+		logger.Error("api_token is required in config")
+		os.Exit(1)
+	}
+	if viper.GetString("api_endpoint") == "" {
+		logger.Error("api_endpoint is required in config")
+		os.Exit(1)
+	}
+	if viper.GetString("api_key") == "" {
+		logger.Error("api_key is required in config")
+		os.Exit(1)
+	}
+	if viper.GetString("default_model") == "" {
+		logger.Error("default_model is required in config")
+		os.Exit(1)
+	}
+
+	// Configure HTTP client with timeout
+	timeoutSecs := viper.GetInt("timeout_secs")
+	if timeoutSecs <= 0 {
+		timeoutSecs = 300 // Default 5 minutes
+	}
+	httpClient.Timeout = time.Duration(timeoutSecs) * time.Second
+	logger.Info("http client configured", slog.Int("timeout_secs", timeoutSecs))
+
+	// Set default max tokens
+	maxTokens := viper.GetInt("max_tokens")
+	if maxTokens <= 0 {
+		maxTokens = 16000
+	}
+	logger.Info("max tokens configured", slog.Int("max_tokens", maxTokens))
 
 	// Ensure data directory exists
 	os.MkdirAll("./data/store", 0755)
